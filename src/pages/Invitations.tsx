@@ -42,8 +42,13 @@ export default function InvitationsPage() {
   };
 
   const handleResend = async (id: string) => {
-    try { await invitationsService.resend(id); loadData(); }
-    catch (err: any) { alert(err.message); }
+    setError('');
+    try {
+      await invitationsService.resend(id);
+      loadData();
+    } catch (err: any) {
+      setError(err.message || 'Failed to resend invitation');
+    }
   };
 
   const handleCancel = async (id: string) => {
@@ -83,6 +88,12 @@ export default function InvitationsPage() {
           <UserPlus size={16} className="mr-2" /> Send Invitation
         </Button>
       </div>
+
+      {error && (
+        <div className="p-3 bg-red-50 border border-red-200 rounded-lg">
+          <p className="text-sm text-red-700">{error}</p>
+        </div>
+      )}
 
       {invitations.length === 0 ? (
         <Card>

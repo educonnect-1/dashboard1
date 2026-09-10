@@ -24,9 +24,5 @@ export const supabase = createClient(
   }
 );
 
-export const getStorageUrl = (bucket: string, path: string) => {
-  const { data } = supabase.storage.from(bucket).getPublicUrl(path);
-  return data.publicUrl;
-};
-
 export const JITSI_DOMAIN = import.meta.env.VITE_JITSI_DOMAIN || 'meet.jit.si';
+export const REGISTRATION_URL = import.meta.env.VITE_REGISTRATION_URL || '';

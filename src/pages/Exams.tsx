@@ -163,6 +163,7 @@ export default function ExamsPage() {
                       <option value="true_false">True/False</option>
                       <option value="short_answer">Short Answer</option>
                       <option value="long_answer">Long Answer</option>
+                      <option value="numerical">Numerical</option>
                     </Select>
                     <Input type="number" value={q.points} onChange={(e) => updateQuestion(i, { points: parseInt(e.target.value) || 0 })} placeholder="Points" />
                   </div>
@@ -184,8 +185,14 @@ export default function ExamsPage() {
                       ))}
                     </div>
                   )}
-                  {q.question_type === 'short_answer' && (
-                    <Input value={q.correct_answer || ''} onChange={(e) => updateQuestion(i, { correct_answer: e.target.value })} placeholder="Correct answer" />
+                  {(q.question_type === 'short_answer' || q.question_type === 'numerical') && (
+                    <Input
+                      type={q.question_type === 'numerical' ? 'number' : 'text'}
+                      value={q.correct_answer || ''}
+                      onChange={(e) => updateQuestion(i, { correct_answer: e.target.value })}
+                      placeholder={q.question_type === 'numerical' ? 'Correct numerical answer' : 'Correct answer'}
+                      step={q.question_type === 'numerical' ? 'any' : undefined}
+                    />
                   )}
                 </div>
               ))}

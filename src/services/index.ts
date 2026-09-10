@@ -1,4 +1,5 @@
 import { supabase } from '../lib/supabase';
+import { getSignedUrl, getChatFileSignedUrl, getResourceSignedUrl, isStoragePath } from '../lib/storage';
 import type {
   Group, GroupMember, Invitation, Message, Assignment, AssignmentSubmission,
   Exam, ExamSubmission, Attendance, Announcement, Resource, JitsiRoom,
@@ -110,6 +111,32 @@ export const groupsService = {
   },
 
   async addMember(groupId: string, studentId: string) {
+    // Verify student exists and has student role
+    const { data: profile, error: profileError } = await supabase
+      .from('profiles')
+      .select('id, role')
+      .eq('id', studentId)
+      .single();
+
+    if (profileError || !profile) {
+      throw new Error('Student not found');
+    }
+    if (profile.role !== 'student') {
+      throw new Error('Can only add students to groups');
+    }
+
+    // Check for duplicate membership
+    const { data: existing } = await supabase
+      .from('group_members')
+      .select('id')
+      .eq('group_id', groupId)
+      .eq('student_id', studentId)
+      .maybeSingle();
+
+    if (existing) {
+      throw new Error('Student is already a member of this group');
+    }
+
     const { error } = await supabase
       .from('group_members')
       .insert({ group_id: groupId, student_id: studentId });
@@ -173,7 +200,7 @@ export const invitationsService = {
   async getAll() {
     const { data, error } = await supabase
       .from('invitations')
-      .select('*, groups:invitation_groups(group_id, groups(name))')
+      .select('*, invitation_groups(group_id, groups(name))')
       .order('created_at', { ascending: false });
     if (error) throw error;
     return data || [];
@@ -183,13 +210,31 @@ export const invitationsService = {
     const { data: { user } } = await supabase.auth.getUser();
     if (!user) throw new Error('Not authenticated');
 
-    const token = uuidv4() + '-' + uuidv4();
-    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+    if (!form.email.trim()) throw new Error('Email is required');
+    if (form.group_ids.length === 0) throw new Error('Select at least one group');
 
+    // Generate cryptographically strong token
+    const token = uuidv4() + '-' + uuidv4() + '-' + uuidv4();
+    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+    const normalizedEmail = form.email.toLowerCase().trim();
+
+    // Check for existing pending invitation for same email
+    const { data: existing } = await supabase
+      .from('invitations')
+      .select('id, status')
+      .eq('email', normalizedEmail)
+      .eq('status', 'pending')
+      .maybeSingle();
+
+    if (existing) {
+      throw new Error('A pending invitation already exists for this email. Cancel or resend the existing one.');
+    }
+
+    // Create invitation
     const { data: invitation, error } = await supabase
       .from('invitations')
       .insert({
-        email: form.email.toLowerCase().trim(),
+        email: normalizedEmail,
         token,
         group_ids: form.group_ids,
         status: 'pending',
@@ -201,14 +246,36 @@ export const invitationsService = {
 
     if (error) throw error;
 
-    // Call edge function to send email
-    try {
-      await supabase.functions.invoke('send-invitation-email', {
-        body: { invitation_id: invitation.id, email: form.email, token },
-      });
-    } catch (emailError) {
-      console.error('Email sending failed:', emailError);
-      // Invitation is saved, email can be resent
+    // Insert into normalized invitation_groups table
+    if (form.group_ids.length > 0) {
+      const groupRecords = form.group_ids.map(groupId => ({
+        invitation_id: invitation.id,
+        group_id: groupId,
+      }));
+
+      const { error: groupsError } = await supabase
+        .from('invitation_groups')
+        .insert(groupRecords);
+
+      if (groupsError) {
+        console.error('Failed to insert invitation_groups:', groupsError);
+        // Continue anyway - invitation is created, groups can be fixed
+      }
+    }
+
+    // Call edge function to send email - DO NOT silently swallow errors
+    const { error: emailError, data: emailResult } = await supabase.functions.invoke('send-invitation-email', {
+      body: { invitation_id: invitation.id, email: normalizedEmail, token },
+    });
+
+    if (emailError) {
+      // Email failed - invitation is saved but email was not sent
+      // Teacher can resend from the invitations list
+      throw new Error(`Invitation created but email failed to send: ${emailError.message || 'Unknown error'}. You can resend from the invitations list.`);
+    }
+
+    if (emailResult && (emailResult as any).error) {
+      throw new Error(`Invitation created but email failed: ${(emailResult as any).error}. You can resend from the invitations list.`);
     }
 
     return invitation;
@@ -222,16 +289,28 @@ export const invitationsService = {
       .single();
     if (error) throw error;
     if (!invitation) throw new Error('Invitation not found');
+    if (invitation.status === 'registered') throw new Error('Cannot resend - invitation already used');
+    if (invitation.status === 'cancelled') throw new Error('Cannot resend - invitation was cancelled');
 
     const newExpiry = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
-    await supabase.from('invitations').update({ expires_at: newExpiry }).eq('id', id);
 
-    try {
-      await supabase.functions.invoke('send-invitation-email', {
-        body: { invitation_id: id, email: invitation.email, token: invitation.token },
-      });
-    } catch (emailError) {
-      console.error('Email resend failed:', emailError);
+    // Reset status to pending (in case it was expired) and update expiry
+    await supabase
+      .from('invitations')
+      .update({ expires_at: newExpiry, status: 'pending' })
+      .eq('id', id);
+
+    // Call edge function to send email
+    const { error: emailError, data: emailResult } = await supabase.functions.invoke('send-invitation-email', {
+      body: { invitation_id: id, email: invitation.email, token: invitation.token },
+    });
+
+    if (emailError) {
+      throw new Error(`Email resend failed: ${emailError.message || 'Unknown error'}`);
+    }
+
+    if (emailResult && (emailResult as any).error) {
+      throw new Error(`Email resend failed: ${(emailResult as any).error}`);
     }
   },
 
@@ -260,7 +339,21 @@ export const chatService = {
 
     const { data, error } = await query;
     if (error) throw error;
-    return (data || []).reverse() as Message[];
+
+    const messages = (data || []) as Message[];
+
+    // Generate signed URLs for any files that use storage paths
+    const messagesWithUrls = await Promise.all(
+      messages.map(async (msg) => {
+        if (msg.file_url && isStoragePath(msg.file_url)) {
+          const signedUrl = await getChatFileSignedUrl(msg.file_url);
+          return { ...msg, file_url: signedUrl || msg.file_url };
+        }
+        return msg;
+      })
+    );
+
+    return messagesWithUrls.reverse();
   },
 
   async sendMessage(groupId: string, content: string) {
@@ -280,21 +373,27 @@ export const chatService = {
     const { data: { user } } = await supabase.auth.getUser();
     if (!user) throw new Error('Not authenticated');
 
+    // Validate file size (max 10MB)
+    if (file.size > 10 * 1024 * 1024) {
+      throw new Error('File size must be less than 10MB');
+    }
+
     const ext = file.name.split('.').pop();
     const path = `${groupId}/${uuidv4()}.${ext}`;
+
     const { error: uploadError } = await supabase.storage
       .from('chat-files')
       .upload(path, file);
-    if (uploadError) throw uploadError;
+    if (uploadError) throw new Error(`File upload failed: ${uploadError.message}`);
 
-    const { data: { publicUrl } } = supabase.storage.from('chat-files').getPublicUrl(path);
-
+    // Store the STORAGE PATH (not a public URL) in the database
+    // The path will be resolved to a signed URL when displaying
     const { data, error } = await supabase
       .from('messages')
       .insert({
         group_id: groupId,
         sender_id: user.id,
-        file_url: publicUrl,
+        file_url: path, // Store path, not public URL
         file_name: file.name,
         file_type: file.type,
         file_size: file.size,
@@ -302,7 +401,15 @@ export const chatService = {
       .select('*, sender:profiles!sender_id(full_name, avatar_url, role)')
       .single();
     if (error) throw error;
-    return data as Message;
+
+    // Generate signed URL for the response
+    const signedUrl = await getChatFileSignedUrl(path);
+    const message = data as Message;
+    if (signedUrl) {
+      message.file_url = signedUrl;
+    }
+
+    return message;
   },
 
   async pinMessage(messageId: string) {
@@ -329,21 +436,49 @@ export const chatService = {
       .eq('is_pinned', true)
       .order('created_at', { ascending: false });
     if (error) throw error;
-    return (data || []) as Message[];
+
+    const messages = (data || []) as Message[];
+
+    // Generate signed URLs for files
+    const messagesWithUrls = await Promise.all(
+      messages.map(async (msg) => {
+        if (msg.file_url && isStoragePath(msg.file_url)) {
+          const signedUrl = await getChatFileSignedUrl(msg.file_url);
+          return { ...msg, file_url: signedUrl || msg.file_url };
+        }
+        return msg;
+      })
+    );
+
+    return messagesWithUrls;
   },
 
   subscribe(groupId: string, callback: (message: Message) => void) {
-    return supabase
+    const channel = supabase
       .channel(`messages:${groupId}`)
       .on('postgres_changes', {
         event: 'INSERT',
         schema: 'public',
         table: 'messages',
         filter: `group_id=eq.${groupId}`,
-      }, (payload) => {
-        callback(payload.new as Message);
+      }, async (payload) => {
+        const newMessage = payload.new as Message;
+        // Generate signed URL for file if needed
+        if (newMessage.file_url && isStoragePath(newMessage.file_url)) {
+          const signedUrl = await getChatFileSignedUrl(newMessage.file_url);
+          if (signedUrl) {
+            newMessage.file_url = signedUrl;
+          }
+        }
+        callback(newMessage);
       })
       .subscribe();
+
+    return {
+      unsubscribe: () => {
+        supabase.removeChannel(channel);
+      },
+    };
   },
 };
 
@@ -656,29 +791,46 @@ export const resourcesService = {
 
     const { data, error } = await query;
     if (error) throw error;
-    return (data || []) as Resource[];
+
+    // Resolve signed URLs for file paths
+    const resources = (data || []) as Resource[];
+    const resolvedResources = await Promise.all(
+      resources.map(async (resource) => {
+        if (resource.file_url && isStoragePath(resource.file_url)) {
+          const signedUrl = await getResourceSignedUrl(resource.file_url);
+          return { ...resource, file_url: signedUrl || resource.file_url };
+        }
+        return resource;
+      })
+    );
+
+    return resolvedResources;
   },
 
   async upload(form: CreateResourceForm, file: File) {
     const { data: { user } } = await supabase.auth.getUser();
     if (!user) throw new Error('Not authenticated');
 
+    // Validate file size (max 50MB)
+    if (file.size > 50 * 1024 * 1024) {
+      throw new Error('File size must be less than 50MB');
+    }
+
     const ext = file.name.split('.').pop();
     const path = `${uuidv4()}.${ext}`;
     const { error: uploadError } = await supabase.storage
       .from('resources')
       .upload(path, file);
-    if (uploadError) throw uploadError;
+    if (uploadError) throw new Error(`File upload failed: ${uploadError.message}`);
 
-    const { data: { publicUrl } } = supabase.storage.from('resources').getPublicUrl(path);
-
+    // Store the STORAGE PATH (not a public URL) in the database
     const { data, error } = await supabase
       .from('resources')
       .insert({
         title: form.title,
         description: form.description,
         category: form.category,
-        file_url: publicUrl,
+        file_url: path, // Store path, not public URL
         file_name: file.name,
         file_size: file.size,
         file_type: file.type,
@@ -688,7 +840,15 @@ export const resourcesService = {
       .select()
       .single();
     if (error) throw error;
-    return data as Resource;
+
+    // Generate signed URL for the response
+    const signedUrl = await getResourceSignedUrl(path);
+    const resource = data as Resource;
+    if (signedUrl) {
+      resource.file_url = signedUrl;
+    }
+
+    return resource;
   },
 
   async delete(id: string) {
@@ -711,6 +871,10 @@ export const jitsiService = {
   async create(form: CreateJitsiRoomForm) {
     const { data: { user } } = await supabase.auth.getUser();
     if (!user) throw new Error('Not authenticated');
+
+    if (form.target_group_ids.length === 0) {
+      throw new Error('Select at least one group');
+    }
 
     const roomId = uuidv4();
     const domain = import.meta.env.VITE_JITSI_DOMAIN || 'meet.jit.si';
@@ -902,13 +1066,22 @@ export const profileService = {
     const { data: { user } } = await supabase.auth.getUser();
     if (!user) throw new Error('Not authenticated');
 
+    // Validate file
+    if (file.size > 5 * 1024 * 1024) {
+      throw new Error('Avatar file size must be less than 5MB');
+    }
+    if (!file.type.startsWith('image/')) {
+      throw new Error('File must be an image');
+    }
+
     const ext = file.name.split('.').pop();
     const path = `${user.id}.${ext}`;
     const { error: uploadError } = await supabase.storage
       .from('avatars')
       .upload(path, file, { upsert: true });
-    if (uploadError) throw uploadError;
+    if (uploadError) throw new Error(`Avatar upload failed: ${uploadError.message}`);
 
+    // Avatars bucket is public, so getPublicUrl is appropriate here
     const { data: { publicUrl } } = supabase.storage.from('avatars').getPublicUrl(path);
     await profileService.updateProfile({ avatar_url: publicUrl });
     return publicUrl;

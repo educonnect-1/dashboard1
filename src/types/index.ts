@@ -111,7 +111,7 @@ export interface ExamQuestion {
   id: string;
   exam_id: string;
   question_text: string;
-  question_type: 'multiple_choice' | 'true_false' | 'short_answer' | 'long_answer';
+  question_type: 'multiple_choice' | 'true_false' | 'short_answer' | 'long_answer' | 'numerical';
   options?: ExamOption[];
   correct_answer?: string;
   points: number;
@@ -271,7 +271,7 @@ export interface CreateExamForm {
 
 export interface CreateQuestionForm {
   question_text: string;
-  question_type: 'multiple_choice' | 'true_false' | 'short_answer' | 'long_answer';
+  question_type: 'multiple_choice' | 'true_false' | 'short_answer' | 'long_answer' | 'numerical';
   options?: { option_text: string; is_correct: boolean }[];
   correct_answer?: string;
   points: number;
